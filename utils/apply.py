@@ -160,7 +160,8 @@ def _find_form_modal(page):
         "div.artdeco-modal:has(button:has-text('Next'))",
         "div[role='dialog']:has(button:has-text('Submit'))",
         "div[role='dialog']:has(button:has-text('Next'))",
-        "div[role='dialog']",
+        "div[role='dialog']:has(input[type='file'])",
+        "div[role='dialog']:has(button:has-text('Review'))",
     ]
     for sel in selectors:
         try:
@@ -182,7 +183,8 @@ def _find_form_modal_silent(page):
         "div.artdeco-modal:has(button:has-text('Next'))",
         "div[role='dialog']:has(button:has-text('Submit'))",
         "div[role='dialog']:has(button:has-text('Next'))",
-        "div[role='dialog']",
+        "div[role='dialog']:has(input[type='file'])",
+        "div[role='dialog']:has(button:has-text('Review'))",
     ]
     for sel in selectors:
         try:
@@ -200,6 +202,20 @@ def apply_easy_apply_job(page, job):
     random_sleep()
 
     try:
+        # Check if already applied to this job
+        already_applied = page.query_selector("span:has-text('Applied'), li-icon[type='success-pebble-icon']")
+        if not already_applied:
+            already_applied = page.evaluate("""() => {
+                const spans = document.querySelectorAll('span');
+                for (const s of spans) {
+                    if (s.innerText && s.innerText.trim() === 'Applied') return true;
+                }
+                return false;
+            }""")
+        if already_applied:
+            print("  ⏭️ Already applied to this job, skipping.")
+            return False
+
         # Find the Easy Apply button
         easy_apply_btn = _find_easy_apply_button(page)
 
@@ -227,6 +243,7 @@ def apply_easy_apply_job(page, job):
         max_steps = 10
         step_count = 0
         empty_next_count = 0  # Track consecutive Next clicks with no fields filled
+        review_click_count = 0  # Track consecutive Review clicks to avoid infinite loop
 
         while step_count < max_steps:
             step_count += 1
@@ -364,15 +381,36 @@ def apply_easy_apply_job(page, job):
 
             random_sleep()
 
+            # Helper: find a button by multiple strategies (modal-level then page-level)
+            def _find_btn(*text_patterns):
+                for pattern in text_patterns:
+                    try:
+                        btn = form_modal.query_selector(f"button:has-text('{pattern}')")
+                        if btn and btn.is_visible():
+                            return btn
+                    except Exception:
+                        pass
+                # Fallback: search from page level inside any visible dialog
+                for pattern in text_patterns:
+                    try:
+                        btn = page.query_selector(f"div[role='dialog'] button:has-text('{pattern}')")
+                        if btn and btn.is_visible():
+                            return btn
+                    except Exception:
+                        pass
+                # Fallback: aria-label
+                for pattern in text_patterns:
+                    try:
+                        btn = page.query_selector(f"button[aria-label*='{pattern}']")
+                        if btn and btn.is_visible():
+                            return btn
+                    except Exception:
+                        pass
+                return None
+
             # Detect submit button
-            submit_btn = form_modal.query_selector(
-                "button:has-text('Submit application')"
-            )
-            if not submit_btn:
-                submit_btn = form_modal.query_selector(
-                    "button:has-text('Submit')"
-                )
-            if submit_btn and submit_btn.is_visible():
+            submit_btn = _find_btn('Submit application', 'Submit')
+            if submit_btn:
                 submit_btn.click()
                 print(f"  ✅ Submitted application for {job.get('title', 'Unknown')}")
                 random_sleep()
@@ -386,18 +424,35 @@ def apply_easy_apply_job(page, job):
                 return True
             else:
                 # Check for review button
-                review_btn = form_modal.query_selector("button:has-text('Review')")
-                if review_btn and review_btn.is_visible():
+                review_btn = _find_btn('Review')
+                if review_btn:
+                    review_click_count += 1
+                    if review_click_count >= 2:
+                        print("  ⚠️ Stuck in Review loop (2 consecutive Review clicks), aborting")
+                        break
                     review_btn.click()
                     print("    Clicked Review button")
                     random_sleep()
+                    # Immediately check for Submit after Review
+                    form_modal = _find_form_modal_silent(page)
+                    if form_modal:
+                        submit_btn = _find_btn('Submit application', 'Submit')
+                        if submit_btn:
+                            submit_btn.click()
+                            print(f"  ✅ Submitted application for {job.get('title', 'Unknown')}")
+                            random_sleep()
+                            try:
+                                dismiss_btn = page.query_selector("button:has-text('Dismiss'), button[aria-label='Dismiss']")
+                                if dismiss_btn and dismiss_btn.is_visible():
+                                    dismiss_btn.click()
+                            except Exception:
+                                pass
+                            return True
                     continue
 
                 # Check for "Next" button to continue multi-step form
-                next_btn = form_modal.query_selector(
-                    "button:has-text('Next'), button[aria-label='Continue to next step']"
-                )
-                if next_btn and next_btn.is_visible():
+                next_btn = _find_btn('Next', 'Continue to next step')
+                if next_btn:
                     if not filled_something:
                         empty_next_count += 1
                         if empty_next_count >= 3:
@@ -405,10 +460,23 @@ def apply_easy_apply_job(page, job):
                             break
                     else:
                         empty_next_count = 0
+                    review_click_count = 0  # Reset review counter when Next succeeds
                     next_btn.click()
                     print("    Clicked Next button")
                     random_sleep()
                     continue
+
+                # Debug: log what buttons ARE visible in the modal
+                try:
+                    all_btns = page.evaluate("""() => {
+                        const dlg = document.querySelector("div[role='dialog']");
+                        if (!dlg) return 'no dialog found';
+                        const btns = dlg.querySelectorAll('button');
+                        return Array.from(btns).filter(b => b.offsetParent !== null).map(b => b.innerText.trim().substring(0, 50)).join(' | ');
+                    }""")
+                    print(f"  🔍 Visible buttons in dialog: {all_btns}")
+                except Exception:
+                    pass
 
                 # No actionable button found
                 print("  ⚠️ No Next, Review, or Submit button found")

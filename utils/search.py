@@ -7,9 +7,18 @@ with open("config.yaml") as f:
     config = yaml.safe_load(f)["job_search"]
 
 
-def search_easy_apply_jobs(page, scroll_times=10):
-    print("🔍 Searching for Easy Apply jobs")
-    page.goto(config["url"])
+# Track applied/seen job IDs across cycles to avoid re-processing
+_seen_job_ids: set = set()
+
+
+def search_easy_apply_jobs(page, scroll_times=10, page_offset=0):
+    print(f"🔍 Searching for Easy Apply jobs (offset={page_offset})")
+    url = config["url"]
+    # Append pagination offset to get fresh results each cycle
+    if page_offset > 0:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}start={page_offset}"
+    page.goto(url)
     wait_for_page_full_load(page)
     random_sleep()
 
@@ -133,5 +142,15 @@ def search_easy_apply_jobs(page, scroll_times=10):
             print(f"⚠️ Error parsing job card: {e}")
             continue
 
-    print(f"✅ Collected {len(jobs)} Easy Apply jobs.")
-    return jobs
+    # Filter out jobs we've already seen/applied to in previous cycles
+    new_jobs = []
+    for job in jobs:
+        jid = job.get("job_id", "")
+        if jid and jid in _seen_job_ids:
+            continue
+        if jid:
+            _seen_job_ids.add(jid)
+        new_jobs.append(job)
+
+    print(f"✅ Collected {len(jobs)} jobs total, {len(new_jobs)} new (filtered {len(jobs) - len(new_jobs)} already seen).")
+    return new_jobs

@@ -1,6 +1,10 @@
+import os
+import glob
+import subprocess
 import time
 import yaml
 from datetime import datetime
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from utils.apply import apply_for_jobs
@@ -14,6 +18,42 @@ from utils.login import (
 from utils.search import search_easy_apply_jobs
 
 CYCLE_INTERVAL_MINUTES = 15
+USER_DATA_DIR = "./user_data"
+
+
+def cleanup_stale_playwright_session():
+    """Remove stale lock files from user_data so Playwright can launch
+    without needing to kill the user's personal Google Chrome."""
+    data_dir = Path(USER_DATA_DIR)
+    if not data_dir.exists():
+        return
+
+    # Remove Chromium lock files that prevent relaunch after a crash
+    lock_files = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+    for lock in lock_files:
+        lock_path = data_dir / lock
+        if lock_path.exists():
+            try:
+                lock_path.unlink()
+                print(f"  Removed stale lock: {lock}")
+            except Exception:
+                pass
+
+    # On Windows, kill only orphaned Playwright Chromium processes
+    # (NOT the user's Google Chrome) by matching the user_data_dir argument
+    if os.name == "nt":
+        try:
+            abs_data_dir = str(data_dir.resolve()).replace("\\", "\\\\")
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 f"Get-WmiObject Win32_Process -Filter \"Name='chrome.exe' OR Name='chromium.exe'\" | "
+                 f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{abs_data_dir}') }} | "
+                 f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"],
+                capture_output=True, text=True, timeout=10
+            )
+        except Exception:
+            pass
+    print("  Playwright session cleanup done.")
 
 
 def _check_logged_in(page):
@@ -39,10 +79,10 @@ def _check_logged_in(page):
         return False
 
 
-def run_apply_cycle(page, browser, cycle_num):
+def run_apply_cycle(page, browser, cycle_num, page_offset=0):
     """Run one search + apply cycle."""
     print(f"\n{'='*60}")
-    print(f"🔄 Cycle {cycle_num} started at {datetime.now().strftime('%I:%M:%S %p')}")
+    print(f"🔄 Cycle {cycle_num} started at {datetime.now().strftime('%I:%M:%S %p')} (page offset: {page_offset})")
     print(f"{'='*60}")
 
     # Re-check login before each cycle
@@ -64,7 +104,7 @@ def run_apply_cycle(page, browser, cycle_num):
         input("Press Enter here after completing the verification...")
         wait_for_page_full_load(page)
 
-    jobs = search_easy_apply_jobs(page)
+    jobs = search_easy_apply_jobs(page, page_offset=page_offset)
     print(jobs)
 
     print("Applying for jobs")
@@ -78,11 +118,23 @@ def main():
     with open("config.yaml") as f:
         config = yaml.safe_load(f).get("automation", {})
 
+    # Clean up stale Playwright locks — does NOT touch the user's Google Chrome
+    cleanup_stale_playwright_session()
+
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
-            user_data_dir="./user_data",
+            user_data_dir=USER_DATA_DIR,
             headless=config.get("headless", False),
-            args=["--start-maximized"],
+            args=[
+                "--start-maximized",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--remote-debugging-port=9223",
+            ],
         )
 
         print("✅ Using existing session.")
@@ -115,8 +167,10 @@ def main():
 
         while True:
             cycle_num += 1
+            # Each cycle searches the next page of results (25 per page on LinkedIn)
+            page_offset = (cycle_num - 1) * 25
             try:
-                run_apply_cycle(page, browser, cycle_num)
+                run_apply_cycle(page, browser, cycle_num, page_offset=page_offset)
             except Exception as e:
                 print(f"⚠️ Cycle {cycle_num} error: {e}")
 

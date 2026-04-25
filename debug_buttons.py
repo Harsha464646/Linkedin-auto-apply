@@ -13,7 +13,15 @@ def main():
         browser = p.chromium.launch_persistent_context(
             user_data_dir="./user_data",
             headless=False,
-            args=["--start-maximized"],
+            args=[
+                "--start-maximized",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+            ],
         )
         page = browser.new_page()
         page.goto("https://www.linkedin.com/feed/")

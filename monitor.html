@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Application Monitor</title>
+<style>
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0d1422; color: #e3e9f3; }
+body { max-width: 1200px; margin: 0 auto; padding: 28px 20px; }
+h1 { margin: 0; font-size: 28px; } h2 { font-size: 18px; margin-top: 0; }
+p { line-height: 1.6; } .muted { color: #a8b5c9; font-size: 14px; }
+header, .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.panel { background: #151f30; border: 1px solid #2b3b51; padding: 20px; border-radius: 12px; margin-top: 18px; }
+.cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 18px; }
+.card { background: #151f30; border: 1px solid #2b3b51; border-radius: 12px; padding: 18px; }
+.value { display: block; font-size: 32px; font-weight: 650; margin-top: 8px; }
+.label { color: #b9c6d8; font-size: 13px; } .badge { border-radius: 20px; padding: 7px 12px; background: #334155; font-weight: 600; }
+.good { color: #a9ebc5; background: #153b30; } .bad { color: #ffd4d4; background: #522727; } .caution { color: #ffe0a1; background: #49381e; }
+.notice { border-left: 4px solid #eeae47; background: #332a1d; padding: 14px 18px; border-radius: 6px; margin-top: 16px; }
+#connection { background: #522727; border-color: #ef7b7b; }
+select { background: #172538; color: inherit; border: 1px solid #526580; padding: 10px; border-radius: 6px; }
+dl { display: grid; grid-template-columns: 150px 1fr; gap: 10px; margin: 16px 0 0; } dt { color: #a8b5c9; } dd { margin: 0; overflow-wrap: anywhere; }
+.table-wrap { overflow-x: auto; } table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { padding: 12px 8px; text-align: left; border-bottom: 1px solid #2b3b51; vertical-align: top; }
+th { color: #a8b5c9; font-size: 12px; text-transform: uppercase; } td { overflow-wrap: anywhere; }
+a { color: #99c3ff; } .result { font-size: 12px; white-space: nowrap; } .empty { padding: 18px 0; color: #a8b5c9; }
+@media (max-width: 800px) { .cards { grid-template-columns: repeat(2, 1fr); } dl { grid-template-columns: 110px 1fr; } }
+</style>
+</head>
+<body>
+<header><div><h1>Application Monitor</h1><p class="muted">Local, read-only monitoring. Refreshes every 2 seconds.</p></div><span id="health" class="badge" role="status">Connecting</span></header>
+<div id="connection" class="notice" role="alert" hidden></div>
+<div class="notice">Counts are <strong>bot-reported</strong>, not an independent LinkedIn audit. Confirmed means the bot observed a success signal; unconfirmed is never counted as confirmed. Verify in LinkedIn: Jobs &rarr; My Jobs &rarr; Applied.</div>
+<section class="panel" aria-labelledby="activity-heading">
+<h2 id="activity-heading">Current activity</h2><strong id="activity">Loading status...</strong>
+<dl><dt>Cycle / offset</dt><dd id="cycle">—</dd><dt>Cycle target</dt><dd id="cycle-target">—</dd><dt>Cycle limits</dt><dd id="cycle-limits">—</dd><dt>Current job</dt><dd id="job">—</dd><dt>Run started</dt><dd id="started">—</dd><dt>Heartbeat</dt><dd id="heartbeat">—</dd><dt>Next cycle</dt><dd id="next">—</dd><dt>Last cycle</dt><dd id="last-cycle">—</dd></dl>
+<div id="last-error" class="notice" role="alert" hidden></div><div id="warnings" class="notice" hidden></div>
+</section>
+<section aria-label="Application results">
+<div class="toolbar" style="margin-top:24px"><h2 style="margin:0">Application results</h2><label>Show <select id="scope"><option value="today">Today</option><option value="run">Current / latest run</option><option value="all">All recorded history</option></select></label></div>
+<div class="cards">
+<div class="card"><span class="label">Jobs processed</span><strong id="processed" class="value">0</strong></div>
+<div class="card"><span class="label">Bot-confirmed jobs</span><strong id="confirmed" class="value">0</strong></div>
+<div class="card"><span class="label">Submit unconfirmed</span><strong id="unconfirmed" class="value">0</strong></div>
+<div class="card"><span class="label">Incomplete / errors</span><strong id="failed" class="value">0</strong></div>
+<div class="card"><span class="label">Skipped jobs</span><strong id="skipped" class="value">0</strong></div>
+</div>
+<p class="muted">Confirmed jobs are deduplicated by job ID. Other counts are outcome records, including repeated attempts. Older history may use earlier confirmation logic. Search failures do not create application records.</p>
+<div class="panel"><h2>Recent results</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Outcome</th><th>Job</th><th>Company</th></tr></thead><tbody id="results"></tbody></table></div><p id="results-empty" class="empty" hidden>No application outcomes recorded in this scope.</p></div>
+</section>
+<section class="panel"><h2>Run events</h2><p class="muted">Search errors and waiting periods appear here even when no applications were attempted.</p><div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div><p id="events-empty" class="empty" hidden>No instrumented run yet. Starting the updated bot will populate live status.</p></section>
+<footer><p id="updated" class="muted">Waiting for data...</p><p class="muted">This monitor cannot start, stop, or submit applications. Closing it does not stop the bot.</p></footer>
+<script>
+const byId = id => document.getElementById(id);
+let snapshot;
+const date = value => value ? new Date(value).toLocaleString() : '—';
+function cell(row, value) { const td = document.createElement('td'); td.textContent = value; row.append(td); return td; }
+function showNotice(id, text) { byId(id).hidden = !text; byId(id).textContent = text || ''; }
+function render() {
+    if (!snapshot) return;
+    const bot = snapshot.bot;
+    const labels = {not_started: 'No instrumented run', unavailable: 'Status unavailable', stale: 'Heartbeat stale / bot may be stopped', stopped: 'Bot stopped', error: 'Bot reporting errors', reporting: 'Bot reporting'};
+    byId('health').textContent = labels[bot.health] || 'Unknown status';
+    byId('health').className = 'badge ' + (bot.health === 'reporting' ? 'good' : bot.health === 'error' ? 'bad' : 'caution');
+    byId('activity').textContent = bot.activity || 'The application bot is not reporting live status.';
+    byId('cycle').textContent = bot.cycle == null ? '—' : `${bot.cycle} / ${bot.page_offset || 0} (${bot.results_found || 0} candidates this cycle)`;
+    byId('cycle-target').textContent = bot.cycle_target ? `${bot.cycle_confirmed || 0} / ${bot.cycle_target} bot-confirmed submissions` : '—';
+    byId('cycle-limits').textContent = bot.cycle_target ? `${bot.cycle_processed || 0} / ${bot.cycle_candidate_limit} jobs processed; ${bot.cycle_pages || 0} / ${bot.cycle_page_limit} search pages` : '—';
+    byId('job').textContent = bot.current_job ? `${bot.current_job.title} — ${bot.current_job.company}` : '—';
+    byId('started').textContent = date(bot.started_at);
+    byId('heartbeat').textContent = bot.heartbeat_at ? `${date(bot.heartbeat_at)} (${bot.heartbeat_age_seconds}s ago)` : '—';
+    byId('next').textContent = bot.next_cycle_at ? `${date(bot.next_cycle_at)}${bot.health === 'stale' || bot.health === 'stopped' ? ' (schedule no longer reliable)' : ''}` : '—';
+    byId('last-cycle').textContent = bot.last_cycle_result || 'Not completed';
+    const error = bot.last_error;
+    showNotice('last-error', error ? `Last error — ${date(error.at)} · cycle ${error.cycle} · ${error.stage}: ${error.message} Consecutive failed cycles: ${bot.consecutive_failures || 0}.` : '');
+    const warnings = [...snapshot.warnings];
+    if (bot.history_write_failed) warnings.push('At least one outcome could not be written to CSV. Current-run counts may differ from history.');
+    showNotice('warnings', warnings.join(' '));
+    const data = snapshot.scopes[byId('scope').value];
+    for (const key of ['processed', 'confirmed', 'unconfirmed', 'failed', 'skipped']) byId(key).textContent = data[key];
+    byId('results').replaceChildren();
+    for (const result of data.recent) {
+        const row = document.createElement('tr');
+        cell(row, date(result.timestamp));
+        const outcome = cell(row, result.status);
+        outcome.className = 'result';
+        const title = cell(row, result.title);
+        if (/^https:\/\/www\.linkedin\.com\/jobs\/view\/[0-9]+\/$/.test(result.link || '')) {
+            const link = document.createElement('a'); link.href = result.link; link.textContent = result.title;
+            link.target = '_blank'; link.rel = 'noopener noreferrer'; title.replaceChildren(link);
+        }
+        cell(row, result.company); byId('results').append(row);
+    }
+    byId('results-empty').hidden = data.recent.length > 0;
+    byId('events').replaceChildren();
+    for (const event of snapshot.events) {
+        const row = document.createElement('tr'); cell(row, date(event.at)); cell(row, event.kind); cell(row, event.message); byId('events').append(row);
+    }
+    byId('events-empty').hidden = snapshot.events.length > 0;
+    byId('updated').textContent = `Monitor updated ${date(snapshot.generated_at)} · Latest CSV result: ${date(snapshot.history_latest_at)}`;
+}
+async function refresh() {
+    try {
+        const response = await fetch('/api/status', {cache: 'no-store'});
+        if (!response.ok) throw new Error('Monitor unavailable');
+        snapshot = await response.json(); render(); showNotice('connection', '');
+    } catch (_) {
+        showNotice('connection', 'Monitor connection lost. Displayed counts may be stale. Check that monitor.py is running.');
+        byId('health').textContent = 'Monitor disconnected'; byId('health').className = 'badge bad';
+    } finally { setTimeout(refresh, 2000); }
+}
+byId('scope').addEventListener('change', render);
+refresh();
+</script>
+</body>
+</html>

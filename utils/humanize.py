@@ -1,11 +1,63 @@
 import random
 import time
+from contextlib import contextmanager
 
 import yaml
 from playwright.sync_api import Page
+from utils.monitoring import reporter
 
 with open("config.yaml") as f:
     config = yaml.safe_load(f)["automation"]
+
+
+@contextmanager
+def timed_action(label):
+    reporter.update(activity=label)
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        yield
+    except Exception:
+        outcome = "error"
+        raise
+    finally:
+        if config.get("timing_logs", True):
+            print(f"  [timing] {label}: {time.monotonic() - started:.2f}s ({outcome})")
+
+
+def navigate_page(page, url, selector=None, label="navigation", timeout=None):
+    with timed_action(label):
+        page.goto(url, wait_until="domcontentloaded",
+                  timeout=timeout or config.get("navigation_timeout_ms", 30000))
+        if selector:
+            page.wait_for_selector(selector, state="visible",
+                                   timeout=config.get("readiness_timeout_ms", 10000))
+
+
+def hard_refresh(page):
+    """Reload the browser tab with the HTTP cache bypassed, like Ctrl+Shift+R."""
+    with timed_action("hard refresh"):
+        applying = page.evaluate("""() => Array.from(document.querySelectorAll('dialog[open], div[role="dialog"]'))
+            .some(dialog => dialog.getClientRects().length > 0 &&
+                Array.from(dialog.querySelectorAll('button')).some(button =>
+                    button.getClientRects().length > 0 &&
+                    /^(next|continue to next step|review|submit|submit application)$/i.test(button.innerText.trim())))""")
+        if applying:
+            raise RuntimeError("An application form is still open; review or close it before refreshing")
+        session = page.context.new_cdp_session(page)
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded",
+                                        timeout=config.get("navigation_timeout_ms", 30000)):
+                session.send("Page.reload", {"ignoreCache": True})
+        finally:
+            session.detach()
+
+
+def bounded_click(element, label="click", timeout=None, force=False):
+    with timed_action(label):
+        if force and (not element.is_visible() or not element.is_enabled()):
+            raise ValueError("Cannot force-click a hidden or disabled control")
+        element.click(timeout=timeout or config.get("action_timeout_ms", 3000), force=force)
 
 
 def random_sleep(min_s=None, max_s=None):
@@ -13,8 +65,10 @@ def random_sleep(min_s=None, max_s=None):
     Sleep for a random duration between min_s and max_s (seconds).
     If not provided, uses values from config.
     """
-    min_s = config["min_action_delay"]
-    max_s = config["max_action_delay"]
+    if min_s is None:
+        min_s = config["min_action_delay"]
+    if max_s is None:
+        max_s = config["max_action_delay"]
     # small skew: sample from a beta-like distribution to favor shorter waits but allow long tails
     u = random.random()
     # bias a bit toward shorter durations
@@ -74,7 +128,13 @@ def wait_for_page_full_load(page, selector=None, timeout=45000):
     Wait for full load on pages like LinkedIn that constantly make background requests.
     - Waits for DOM + load.
     - Optionally waits for a key selector (e.g. main content).
-    - Then sleeps a randomized buffer.
+    - Then waits until the rendered content actually settles.
+
+    The settle step replaces what used to be a flat 2.5-5s sleep on every
+    navigation. LinkedIn usually finishes rendering well inside that window, so
+    the fixed sleep was mostly dead time; polling returns as soon as the DOM
+    stops changing and only falls back to the full budget when it really is
+    still loading.
     """
     page.wait_for_load_state("domcontentloaded", timeout=timeout)
     page.wait_for_load_state("load", timeout=timeout)
@@ -86,7 +146,29 @@ def wait_for_page_full_load(page, selector=None, timeout=45000):
         except Exception:
             print(f"⚠️ Selector {selector} not found within {timeout} ms.")
 
-    # Add a realistic random pause
-    extra_delay = random.uniform(2.5, 5.0)
-    print(f"🕐 Waiting an extra {extra_delay:.2f}s for async UI rendering...")
-    time.sleep(extra_delay)
+    wait_until_settled(page)
+
+
+def wait_until_settled(page, max_wait=None, poll=0.25, stable_polls=2):
+    """Block until the DOM stops growing, then add a small human-like jitter."""
+    if max_wait is None:
+        max_wait = config.get("max_settle_wait", 4.0)
+
+    deadline = time.monotonic() + max_wait
+    last_size, stable = -1, 0
+    while time.monotonic() < deadline:
+        try:
+            size = page.evaluate("() => document.body ? document.body.innerHTML.length : 0")
+        except Exception:
+            break
+        if size == last_size:
+            stable += 1
+            if stable >= stable_polls:
+                break
+        else:
+            stable = 0
+            last_size = size
+        time.sleep(poll)
+
+    # Keep a short randomized pause so interactions still look human.
+    random_sleep()

@@ -1,3 +1,4 @@
+import json
 import os
 
 import yaml
@@ -10,6 +11,8 @@ from utils.humanize import (
     random_sleep,
     wait_for_page_full_load,
 )
+
+from utils.monitoring import reporter
 
 load_dotenv()
 
@@ -25,7 +28,7 @@ with open("config.yaml") as f:
 def linkedin_login(p):
     """Logs into LinkedIn and saves session for reuse."""
 
-    headless = config["linkedin"]["headless"]
+    headless = config.get("automation", {}).get("headless", False)
 
     browser = p.chromium.launch(headless=headless)
     context = browser.new_context()
@@ -80,6 +83,7 @@ def perform_login(page: Page):
     current_url = page.url.lower()
     current_title = page.title().lower()
     if "checkpoint" in current_url or "security" in current_title or "verify" in current_url:
+        reporter.update(phase="awaiting_input", activity="Waiting for manual security verification")
         print("🛡️ Security verification detected! Please complete it in the browser window.")
         input("Press Enter here after completing the verification...")
         wait_for_page_full_load(page)
@@ -96,7 +100,10 @@ def save_cookies(browser_context):
 def load_cookies(browser_context):
     path = "./user_data/cookies.json"
     try:
-        browser_context.add_cookies(path)
+        with open(path) as f:
+            state = json.load(f)
+        cookies = state.get("cookies", state) if isinstance(state, dict) else state
+        browser_context.add_cookies(cookies)
         print(f"🍪 Loaded cookies from {path}")
     except Exception:
         print("⚠️ No cookies found or invalid file.")
